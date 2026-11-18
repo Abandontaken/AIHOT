@@ -153,7 +153,9 @@ jobs:
           read_parent() {
             local err meta fork parent parent_lc upstream_lc
             err=$(mktemp)
-            if ! meta=$(gh api "repos/${REPO}" --jq '[.fork|tostring, (.parent.full_name // "")] | @tsv' 2>"$err"); then
+            # gojq binds "|" looser than the comma, so the tostring pipe must be
+            # parenthesized. Otherwise `.parent` is evaluated against the boolean `.fork`.
+            if ! meta=$(gh api "repos/${REPO}" --jq '[(.fork|tostring), (.parent.full_name // "")] | @tsv' 2>"$err"); then
               echo "Could not read ${REPO}; refusing to sync." >&2
               redact_file "$err" >&2
               rm -f "$err"
