@@ -1,0 +1,749 @@
+# Fork housekeeping: update this fork's main from KKKKhazix/AIHOT main, then
+# keep every other Actions workflow disabled. GitHub can register or re-enable
+# inherited workflows a second or two after one disable/cancel pass, and an
+# empty Actions list does not mean those workflow files are gone.
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '17 19 * * *'
+  workflow_dispatch:
+
+# GITHUB_TOKEN: disable/cancel (actions), read workflow files (contents),
+# conflict issues (issues). The sync call uses FORK_SYNC_TOKEN, not this token.
+permissions:
+  actions: write
+  contents: read
+  issues: write
+
+concurrency:
+  group: fork-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository != 'KKKKhazix/AIHOT'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      REPO: ${{ github.repository }}
+      UPSTREAM: KKKKhazix/AIHOT
+      BRANCH: main
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      SELF_PATH: .github/workflows/sync-upstream.yml
+      SELF_RUN_ID: ${{ github.run_id }}
+      SERVER: ${{ github.server_url }}
+    steps:
+      - name: Install housekeeping script
+        run: |
+          cat > "${RUNNER_TEMP}/fork-sync.sh" <<'FORK_SYNC_SCRIPT_END'
+          #!/usr/bin/env bash
+          lower() {
+            printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+          }
+
+          validate_repo_name() {
+            case "$1" in
+              [A-Za-z0-9_.-]*/[A-Za-z0-9_.-]*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          redact_file() {
+            sed -E \
+              -e 's/(ghp_|github_pat_|gho_|ghu_|ghs_|ghr_)[A-Za-z0-9_]+/[REDACTED]/g' \
+              -e 's/(Bearer[[:space:]]+)[^[:space:]]+/\1[REDACTED]/g' \
+              -e 's#(https://)[^[:space:]/@]+@#\1[REDACTED]@#g' \
+              "$1"
+          }
+
+          show_redacted() {
+            local file="$1" line n=0
+            while IFS= read -r line || [ -n "$line" ]; do
+              n=$((n + 1))
+              if [ "$n" -gt 80 ]; then
+                echo "...(truncated)"
+                break
+              fi
+              printf '%s\n' "$line"
+            done < <(redact_file "$file")
+          }
+
+          write_kv() {
+            if [ -n "${GITHUB_OUTPUT:-}" ]; then
+              printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"
+            fi
+          }
+
+          normalize_workflow_path() {
+            local p="$1"
+            p="${p#./}"
+            case "$p" in
+              .github/workflows/*) printf '%s\n' "$p" ;;
+              *) printf '.github/workflows/%s\n' "${p##*/}" ;;
+            esac
+          }
+
+          should_disable_state() {
+            case "$1" in
+              disabled_manually|deleted|"") return 1 ;;
+              *) return 0 ;;
+            esac
+          }
+
+          should_enable_self() {
+            case "$1" in
+              active|deleted|"") return 1 ;;
+              *) return 0 ;;
+            esac
+          }
+
+          is_conflict_file() {
+            grep -Eqi 'diverg|not a fast forward|non-fast-forward|merge conflict' "$1"
+          }
+
+          # Cancel only a run created by this sync push. Leave this workflow,
+          # manual dispatches, schedules, pull requests, and older runs alone.
+          should_cancel_run() {
+            local id="$1" path="$2" event="$3" head_sha="$4" head_branch="$5" created_epoch="$6"
+            local norm earliest age
+            [ "${SYNC_MOVED}" = "true" ] || return 1
+            [ -n "${SYNC_SHA}" ] || return 1
+            case "${SYNC_STARTED_EPOCH}" in
+              ''|*[!0-9]*) return 1 ;;
+            esac
+            case "$id" in
+              ''|*[!0-9]*) return 1 ;;
+            esac
+            [ "$id" != "${SELF_RUN_ID}" ] || return 1
+            norm=$(normalize_workflow_path "$path")
+            [ "$norm" != "${SELF_PATH}" ] || return 1
+            [ "$head_sha" = "${SYNC_SHA}" ] || return 1
+            [ "$head_branch" = "${BRANCH}" ] || return 1
+            case "$event" in
+              push|workflow_run) ;;
+              *) return 1 ;;
+            esac
+            case "$created_epoch" in
+              ''|*[!0-9]*) return 1 ;;
+            esac
+            earliest=$((SYNC_STARTED_EPOCH - 15))
+            [ "$created_epoch" -ge "$earliest" ] || return 1
+            age=$((NOW_EPOCH - created_epoch))
+            [ "$age" -le 900 ] || return 1
+            [ "$age" -ge -120 ] || return 1
+            return 0
+          }
+
+          require_repo() {
+            REPO="${REPO:?REPO is required}"
+            UPSTREAM="${UPSTREAM:-KKKKhazix/AIHOT}"
+            BRANCH="${BRANCH:-main}"
+            SELF_PATH="${SELF_PATH:-.github/workflows/sync-upstream.yml}"
+            if ! validate_repo_name "$REPO" || ! validate_repo_name "$UPSTREAM"; then
+              echo "Unexpected repository name; refusing to continue." >&2
+              exit 1
+            fi
+          }
+
+          repo_is_upstream() {
+            [ "$(lower "$REPO")" = "$(lower "$UPSTREAM")" ]
+          }
+
+          read_parent() {
+            local err meta fork parent parent_lc upstream_lc
+            err=$(mktemp)
+            if ! meta=$(gh api "repos/${REPO}" --jq '[.fork|tostring, (.parent.full_name // "")] | @tsv' 2>"$err"); then
+              echo "Could not read ${REPO}; refusing to sync." >&2
+              redact_file "$err" >&2
+              rm -f "$err"
+              return 1
+            fi
+            rm -f "$err"
+            fork="${meta%%$'\t'*}"
+            parent="${meta#*$'\t'}"
+            parent_lc=$(lower "$parent")
+            upstream_lc=$(lower "$UPSTREAM")
+            if [ "$fork" != "true" ] || [ "$parent_lc" != "$upstream_lc" ]; then
+              echo "Refusing to sync ${REPO}: fork=${fork}, parent=${parent:-none}. This job only updates a fork of ${UPSTREAM}." >&2
+              return 1
+            fi
+            echo "Confirmed ${REPO} is a fork of ${parent}."
+            return 0
+          }
+
+          cmd_guard() {
+            require_repo
+            proceed=false
+            trap 'write_kv proceed "$proceed"' EXIT
+            if repo_is_upstream; then
+              echo "Refusing to sync ${UPSTREAM} from itself."
+              exit 0
+            fi
+            if ! read_parent; then
+              exit 1
+            fi
+            proceed=true
+            exit 0
+          }
+
+          cmd_sync() {
+            local err sync_log redacted args
+            require_repo
+            ok=false
+            moved=false
+            conflict=false
+            sync_exit=refused
+            before_sha=
+            after_sha=
+            started_epoch=
+            trap 'write_kv ok "$ok"; write_kv moved "$moved"; write_kv conflict "$conflict"; write_kv sync_exit "$sync_exit"; write_kv before_sha "$before_sha"; write_kv after_sha "$after_sha"; write_kv started_epoch "$started_epoch"' EXIT
+            export GH_PROMPT_DISABLED=1
+            export GIT_TERMINAL_PROMPT=0
+            unset GH_DEBUG || true
+            unset GH_VERBOSE || true
+            if repo_is_upstream; then
+              echo "Refusing to sync ${UPSTREAM} from itself."
+              exit 0
+            fi
+            if [ -n "${DEFAULT_BRANCH:-}" ] && [ "$DEFAULT_BRANCH" != "main" ]; then
+              echo "Refusing to sync: default branch is ${DEFAULT_BRANCH}, expected main."
+              exit 0
+            fi
+            if [ -z "${GH_TOKEN:-}" ]; then
+              echo "FORK_SYNC_TOKEN is unavailable; refusing to sync."
+              exit 0
+            fi
+            if ! read_parent; then
+              exit 0
+            fi
+            err=$(mktemp)
+            sync_log=$(mktemp)
+            if ! before_sha=$(gh api "repos/${REPO}/commits/${BRANCH}" --jq .sha 2>"$err"); then
+              echo "Could not read ${BRANCH} before sync; not syncing." >&2
+              redact_file "$err" >&2
+              rm -f "$err"
+              exit 0
+            fi
+            if [[ ! "$before_sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Refusing to sync: commit sha from the API was not a 40-character hex string."
+              rm -f "$err"
+              exit 0
+            fi
+            started_epoch=$(date -u +%s)
+            args=(repo sync "$REPO" --source "$UPSTREAM" --branch "$BRANCH")
+            local arg
+            for arg in "${args[@]}"; do
+              if [ "$arg" = "--force" ]; then
+                echo "Refusing to run a sync that overwrites fork commits." >&2
+                rm -f "$err"
+                exit 1
+              fi
+            done
+            echo "Syncing ${UPSTREAM} ${BRANCH} into ${REPO} ${BRANCH}."
+            set +e
+            gh "${args[@]}" >"$sync_log" 2>&1
+            sync_exit=$?
+            set -e
+            echo "gh repo sync exit ${sync_exit}"
+            show_redacted "$sync_log"
+            redacted=$(mktemp)
+            redact_file "$sync_log" > "$redacted"
+            if ! after_sha=$(gh api "repos/${REPO}/commits/${BRANCH}" --jq .sha 2>"$err"); then
+              echo "Could not read ${BRANCH} after sync." >&2
+              redact_file "$err" >&2
+              after_sha=
+            elif [[ ! "$after_sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Commit sha after sync was not a 40-character hex string." >&2
+              after_sha=
+            fi
+            rm -f "$err"
+            if [ "$sync_exit" -eq 0 ] && [ -n "$after_sha" ]; then
+              ok=true
+              if [ "$before_sha" != "$after_sha" ]; then
+                moved=true
+                echo "Updated ${BRANCH} ${before_sha} -> ${after_sha}."
+              else
+                echo "${BRANCH} already matched upstream (${after_sha})."
+              fi
+            else
+              ok=false
+              if [ "$sync_exit" -ne 0 ] && is_conflict_file "$redacted"; then
+                conflict=true
+                echo "Sync stopped because ${BRANCH} has diverged. Fork commits were left in place."
+              elif [ "$sync_exit" -ne 0 ]; then
+                echo "Sync failed without a divergence signature; not opening a merge-conflict issue."
+              fi
+            fi
+            rm -f "$sync_log" "$redacted"
+            exit 0
+          }
+
+          list_tree_names() {
+            local ref="$1" dest="$2" err
+            err=$(mktemp)
+            if gh api "repos/${REPO}/contents/.github/workflows?ref=${ref}" \
+              --jq 'if type=="array" then .[] | select(.type=="file") | .name else empty end' \
+              >"$dest" 2>"$err"; then
+              rm -f "$err"
+              return 0
+            fi
+            if grep -Eq '404|Not Found' "$err"; then
+              : >"$dest"
+              rm -f "$err"
+              return 0
+            fi
+            echo "Could not list workflow files at ${ref}." >&2
+            redact_file "$err" >&2
+            rm -f "$err"
+            return 1
+          }
+
+          cancel_attributable_runs() {
+            local status id path event head_sha head_branch created_at url run_status
+            local created_epoch norm out err
+            cancel_this_pass=0
+            if [ "$SYNC_MOVED" != "true" ]; then
+              return 0
+            fi
+            for status in queued in_progress waiting requested pending; do
+              out=$(mktemp)
+              err=$(mktemp)
+              if ! gh api --paginate "repos/${REPO}/actions/runs?status=${status}&per_page=100" \
+                --jq '.workflow_runs[]? | [.id, (.path // ""), .event, .head_sha, (.head_branch // ""), .created_at, .html_url, .status] | @tsv' \
+                >"$out" 2>"$err"; then
+                echo "Could not list ${status} workflow runs." >&2
+                redact_file "$err" >&2
+                rm -f "$out" "$err"
+                exit 1
+              fi
+              rm -f "$err"
+              while IFS=$'\t' read -r id path event head_sha head_branch created_at url run_status || [ -n "${id:-}" ]; do
+                [ -n "${id:-}" ] || continue
+                id=${id%$'\r'}
+                path=${path%$'\r'}
+                event=${event%$'\r'}
+                head_sha=${head_sha%$'\r'}
+                head_branch=${head_branch%$'\r'}
+                created_at=${created_at%$'\r'}
+                url=${url%$'\r'}
+                run_status=${run_status%$'\r'}
+                if [ -n "${CANCELLED[$id]:-}" ]; then
+                  continue
+                fi
+                norm=$(normalize_workflow_path "$path")
+                created_epoch=$(date -u -d "$created_at" +%s 2>/dev/null) || created_epoch=""
+                if should_cancel_run "$id" "$path" "$event" "$head_sha" "$head_branch" "$created_epoch"; then
+                  echo "Cancelling ${norm} run ${id} (event=${event}, status=${run_status}) ${url}"
+                  if gh api --method POST "repos/${REPO}/actions/runs/${id}/cancel" >/dev/null; then
+                    CANCELLED[$id]=1
+                    cancel_this_pass=$((cancel_this_pass + 1))
+                  else
+                    echo "Cancel failed for ${id} (it may already be finishing)."
+                  fi
+                elif [ -n "$SYNC_SHA" ] && [ "$head_sha" = "$SYNC_SHA" ]; then
+                  echo "Not cancelling run ${id} (${norm}, event=${event}, branch=${head_branch})."
+                fi
+              done < "$out"
+              rm -f "$out"
+            done
+          }
+
+          cleanup_pass() {
+            local reg tree err id path state file norm
+            pass_clean=1
+            last_problem=""
+            reg=$(mktemp)
+            tree=$(mktemp)
+            err=$(mktemp)
+            if ! gh api --paginate "repos/${REPO}/actions/workflows" \
+              --jq '.workflows[]? | [.id, .path, .state] | @tsv' >"$reg" 2>"$err"; then
+              echo "Could not list Actions workflows." >&2
+              redact_file "$err" >&2
+              rm -f "$reg" "$tree" "$err"
+              exit 1
+            fi
+            rm -f "$err"
+            if ! list_tree_names "$TREE_REF" "$tree"; then
+              rm -f "$reg" "$tree"
+              exit 1
+            fi
+            declare -A seen=()
+            local registry_count=0 tree_count=0
+            while IFS= read -r file || [ -n "$file" ]; do
+              [ -n "$file" ] || continue
+              case "$file" in
+                *.yml|*.yaml) tree_count=$((tree_count + 1)) ;;
+                *) continue ;;
+              esac
+            done < "$tree"
+            while IFS=$'\t' read -r id path state || [ -n "${id:-}" ]; do
+              [ -n "${id:-}" ] || continue
+              id=${id%$'\r'}
+              path=${path%$'\r'}
+              state=${state%$'\r'}
+              case "$id" in
+                ''|*[!0-9]*)
+                  echo "Unexpected workflow id from the Actions API." >&2
+                  exit 1
+                  ;;
+              esac
+              registry_count=$((registry_count + 1))
+              norm=$(normalize_workflow_path "$path")
+              file=${norm##*/}
+              seen[$file]=1
+              if [ "$norm" = "$SELF_PATH" ]; then
+                if should_enable_self "$state"; then
+                  echo "Enabling ${norm} (${id}, state=${state})"
+                  if ! gh api --method PUT "repos/${REPO}/actions/workflows/${id}/enable" >/dev/null; then
+                    echo "Could not enable ${norm}." >&2
+                    exit 1
+                  fi
+                  pass_clean=0
+                  last_problem="enabled ${file} from ${state}"
+                fi
+                continue
+              fi
+              if should_disable_state "$state"; then
+                echo "Disabling ${norm} (${id}, state=${state})"
+                if ! gh api --method PUT "repos/${REPO}/actions/workflows/${id}/disable" >/dev/null; then
+                  echo "Could not disable ${norm}." >&2
+                  exit 1
+                fi
+                pass_clean=0
+                last_problem="disabled ${file} from ${state}"
+              fi
+            done < "$reg"
+            if [ "$tree_count" -gt 0 ] && [ "$registry_count" -eq 0 ]; then
+              echo "Actions workflow list is empty while workflow files exist on ${TREE_REF}; this is not completed cleanup."
+              pass_clean=0
+              last_problem="empty Actions list"
+            fi
+            while IFS= read -r file || [ -n "$file" ]; do
+              [ -n "$file" ] || continue
+              case "$file" in
+                *.yml|*.yaml) ;;
+                *) continue ;;
+              esac
+              if [[ ! "$file" =~ ^[A-Za-z0-9._-]+\.ya?ml$ ]]; then
+                echo "Skipping unexpected workflow file name: ${file}"
+                pass_clean=0
+                last_problem="unexpected file ${file}"
+                continue
+              fi
+              if [ -n "${seen[$file]:-}" ]; then
+                continue
+              fi
+              pass_clean=0
+              last_problem="unregistered ${file}"
+              if [ ".github/workflows/${file}" = "$SELF_PATH" ]; then
+                echo "Sync workflow ${file} is not registered in Actions yet."
+                continue
+              fi
+              echo "Inherited workflow ${file} is not registered yet; trying disable by file name."
+              local name_err name_rc
+              name_err=$(mktemp)
+              name_rc=0
+              gh api --method PUT "repos/${REPO}/actions/workflows/${file}/disable" >/dev/null 2>"$name_err" || name_rc=$?
+              if [ "$name_rc" -eq 0 ]; then
+                echo "Disable-by-name accepted for ${file}; waiting to observe it as disabled_manually."
+                last_problem="disable-by-name ${file}"
+              elif grep -Eq '404|Not Found' "$name_err"; then
+                echo "Inherited workflow ${file} is still absent from Actions."
+              else
+                echo "Could not disable unregistered workflow ${file}." >&2
+                redact_file "$name_err" >&2
+                rm -f "$name_err"
+                exit 1
+              fi
+              rm -f "$name_err"
+            done < "$tree"
+            if [ "$SYNC_MOVED" = "true" ]; then
+              NOW_EPOCH=$(date -u +%s)
+              cancel_attributable_runs
+              if [ "$cancel_this_pass" -gt 0 ]; then
+                pass_clean=0
+                last_problem="cancelled ${cancel_this_pass} run(s)"
+              fi
+            fi
+            echo "Cleanup scan: registry=${registry_count} tree_files=${tree_count} clean=${pass_clean} ${last_problem}"
+            rm -f "$reg" "$tree"
+          }
+
+          cmd_cleanup() {
+            local attempt consecutive
+            require_repo
+            SELF_RUN_ID="${SELF_RUN_ID:?SELF_RUN_ID is required}"
+            MAX_ATTEMPTS="${MAX_ATTEMPTS:-8}"
+            SLEEP_SECONDS="${SLEEP_SECONDS:-3}"
+            CONFIRM_PASSES="${CONFIRM_PASSES:-2}"
+            REQUIRE_CONFIRM="${REQUIRE_CONFIRM:-true}"
+            SYNC_MOVED="${SYNC_MOVED:-false}"
+            TREE_REF=$(lower "${TREE_REF:-main}")
+            SYNC_SHA="${SYNC_SHA:-}"
+            SYNC_STARTED_EPOCH="${SYNC_STARTED_EPOCH:-0}"
+            case "$MAX_ATTEMPTS" in
+              ''|*[!0-9]*) echo "MAX_ATTEMPTS must be an integer." >&2; exit 1 ;;
+            esac
+            case "$SLEEP_SECONDS" in
+              ''|*[!0-9]*) echo "SLEEP_SECONDS must be an integer." >&2; exit 1 ;;
+            esac
+            case "$CONFIRM_PASSES" in
+              ''|*[!0-9]*) echo "CONFIRM_PASSES must be an integer." >&2; exit 1 ;;
+            esac
+            if [ "$MAX_ATTEMPTS" -lt 2 ] || [ "$MAX_ATTEMPTS" -gt 12 ]; then
+              echo "MAX_ATTEMPTS must stay between 2 and 12." >&2
+              exit 1
+            fi
+            if [ "$SLEEP_SECONDS" -gt 10 ]; then
+              echo "SLEEP_SECONDS must stay at or below 10." >&2
+              exit 1
+            fi
+            if [ "$CONFIRM_PASSES" -lt 2 ] || [ "$CONFIRM_PASSES" -gt "$MAX_ATTEMPTS" ]; then
+              echo "CONFIRM_PASSES must be at least 2 and at most MAX_ATTEMPTS." >&2
+              exit 1
+            fi
+            case "$SYNC_MOVED" in
+              true|false) ;;
+              *) echo "Unexpected SYNC_MOVED value." >&2; exit 1 ;;
+            esac
+            case "$TREE_REF" in
+              main|[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+              *) echo "Unexpected tree ref ${TREE_REF}." >&2; exit 1 ;;
+            esac
+            case "$SELF_RUN_ID" in
+              ''|*[!0-9]*) echo "SELF_RUN_ID must be numeric." >&2; exit 1 ;;
+            esac
+            confirmed=false
+            trap 'write_kv confirmed "$confirmed"' EXIT
+            if [ "$SYNC_MOVED" != "true" ]; then
+              echo "This sync did not update ${BRANCH}; not cancelling workflow runs."
+            fi
+            declare -A CANCELLED=()
+            consecutive=0
+            attempt=0
+            while [ "$attempt" -lt "$MAX_ATTEMPTS" ]; do
+              attempt=$((attempt + 1))
+              echo "Cleanup scan ${attempt}/${MAX_ATTEMPTS}"
+              cleanup_pass
+              if [ "$pass_clean" -eq 1 ]; then
+                consecutive=$((consecutive + 1))
+              else
+                consecutive=0
+              fi
+              if [ "$consecutive" -ge "$CONFIRM_PASSES" ]; then
+                confirmed=true
+                break
+              fi
+              if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+                sleep "$SLEEP_SECONDS"
+              fi
+            done
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              {
+                echo "### Inherited workflow cleanup"
+                echo
+                echo "- Confirmed: ${confirmed}"
+                echo "- Scans: ${attempt}"
+                echo "- Last note: ${last_problem:-none}"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+            if [ "$confirmed" != true ]; then
+              echo "Cleanup was not confirmed after ${attempt} scan(s)."
+              echo "Inherited workflows are still active, still unregistered, or the Actions list was empty while workflow files exist. An empty Actions list is not completed cleanup."
+              if [ -n "${last_problem:-}" ]; then
+                echo "Last scan: ${last_problem}"
+              fi
+              if [ "$REQUIRE_CONFIRM" = "true" ]; then
+                exit 1
+              fi
+              echo "Best-effort cleanup finished without confirmation."
+              exit 0
+            fi
+            echo "Cleanup confirmed after ${attempt} scan(s)."
+            exit 0
+          }
+
+          write_issue_summary() {
+            if [ -z "${GITHUB_STEP_SUMMARY:-}" ]; then
+              return 0
+            fi
+            cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## Upstream sync needs manual merge
+
+          Automatic daily sync from upstream failed because this fork has diverged or has merge conflicts.
+
+          This workflow never force-pushes. Please merge upstream into the default branch manually (GitHub's "Sync fork" UI, or a local merge), then resolve conflicts.
+
+          Failed run: ${SERVER}/${REPO}/actions/runs/${SELF_RUN_ID}
+
+          A GitHub issue could not be created or updated. Issues may be disabled on this repository.
+          EOF
+          }
+
+          cmd_issue() {
+            local title existing list_status body_file comment_file
+            require_repo
+            SELF_RUN_ID="${SELF_RUN_ID:?SELF_RUN_ID is required}"
+            SERVER="${SERVER:?SERVER is required}"
+            case "$SELF_RUN_ID" in
+              ''|*[!0-9]*) echo "Run id must be numeric." >&2; exit 1 ;;
+            esac
+            case "$SERVER" in
+              https://github.com) ;;
+              *) echo "Refusing to write an issue with an unexpected server URL." >&2; exit 1 ;;
+            esac
+            if [ "${CONFLICT:-}" != "true" ]; then
+              echo "No genuine sync conflict; not opening an issue."
+              exit 0
+            fi
+            title="Upstream sync needs manual merge"
+            body_file=$(mktemp)
+            comment_file=$(mktemp)
+            cat > "$body_file" <<EOF
+          Automatic daily sync from upstream failed because this fork has diverged or has merge conflicts.
+
+          This workflow never force-pushes. Please merge upstream into the default branch manually (GitHub's "Sync fork" UI, or a local merge), then resolve conflicts.
+
+          Failed run: ${SERVER}/${REPO}/actions/runs/${SELF_RUN_ID}
+
+          Close this issue after you have merged.
+          EOF
+            cat > "$comment_file" <<EOF
+          Another automatic sync attempt failed. Manual merge is still required.
+
+          Run: ${SERVER}/${REPO}/actions/runs/${SELF_RUN_ID}
+          EOF
+            set +e
+            existing=$(gh issue list --repo "$REPO" --state open --limit 50 \
+              --search 'in:title "Upstream sync needs manual merge"' \
+              --json number,title \
+              --jq '.[] | select(.title=="Upstream sync needs manual merge") | .number' 2>"$body_file.err")
+            list_status=$?
+            set -e
+            if [ "$list_status" -ne 0 ]; then
+              echo "Could not list issues; writing the notice to the job summary."
+              redact_file "$body_file.err" >&2 || true
+              write_issue_summary
+              rm -f "$body_file" "$comment_file" "$body_file.err"
+              exit 0
+            fi
+            existing=${existing%%$'\n'*}
+            if [ -n "$existing" ]; then
+              if ! gh issue comment "$existing" --repo "$REPO" --body-file "$comment_file"; then
+                echo "Could not comment on issue #${existing}."
+                write_issue_summary
+                rm -f "$body_file" "$comment_file" "$body_file.err"
+                exit 0
+              fi
+              echo "Updated conflict issue #${existing}."
+            else
+              if ! gh issue create --repo "$REPO" --title "$title" --body-file "$body_file"; then
+                echo "Could not open a conflict issue."
+                write_issue_summary
+                rm -f "$body_file" "$comment_file" "$body_file.err"
+                exit 0
+              fi
+              echo "Opened a conflict issue."
+            fi
+            rm -f "$body_file" "$comment_file" "$body_file.err"
+            exit 0
+          }
+
+          cmd_fail() {
+            local status=0
+            if [ "${OK:-}" != "true" ]; then
+              echo "Upstream sync failed (${SYNC_EXIT:-unknown}). This is a real sync failure, not a notice-step error."
+              status=1
+            fi
+            if [ "${CONFIRMED:-}" != "true" ]; then
+              echo "Inherited workflow cleanup was not confirmed. An empty Actions list is not treated as success."
+              status=1
+            fi
+            exit "$status"
+          }
+
+          main() {
+            set -euo pipefail
+            export LC_ALL=C
+            unset GH_DEBUG || true
+            unset GH_VERBOSE || true
+            case "${1:-}" in
+              guard) cmd_guard ;;
+              sync) cmd_sync ;;
+              cleanup) cmd_cleanup ;;
+              issue) cmd_issue ;;
+              fail) cmd_fail ;;
+              *)
+                echo "usage: fork-sync.sh guard|sync|cleanup|issue|fail" >&2
+                exit 2
+                ;;
+            esac
+          }
+
+          if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+            main "$@"
+          fi
+          FORK_SYNC_SCRIPT_END
+          chmod 700 "${RUNNER_TEMP}/fork-sync.sh"
+
+      - name: Confirm this fork
+        id: guard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_PROMPT_DISABLED: "1"
+        run: bash "${RUNNER_TEMP}/fork-sync.sh" guard
+
+      - name: Disable inherited workflows before sync
+        if: success() && steps.guard.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_PROMPT_DISABLED: "1"
+          REQUIRE_CONFIRM: "false"
+          MAX_ATTEMPTS: "3"
+          SLEEP_SECONDS: "2"
+          CONFIRM_PASSES: "2"
+          SYNC_MOVED: "false"
+          TREE_REF: main
+        run: bash "${RUNNER_TEMP}/fork-sync.sh" cleanup
+
+      - name: Sync from upstream
+        id: sync
+        if: success() && steps.guard.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_PROMPT_DISABLED: "1"
+          GIT_TERMINAL_PROMPT: "0"
+        run: bash "${RUNNER_TEMP}/fork-sync.sh" sync
+
+      - name: Disable inherited workflows and cancel sync-triggered runs
+        id: cleanup
+        if: always() && steps.guard.outputs.proceed == 'true' && steps.sync.conclusion != 'skipped'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_PROMPT_DISABLED: "1"
+          REQUIRE_CONFIRM: "true"
+          MAX_ATTEMPTS: "8"
+          SLEEP_SECONDS: "3"
+          CONFIRM_PASSES: "2"
+          SYNC_MOVED: ${{ steps.sync.outputs.moved || 'false' }}
+          SYNC_SHA: ${{ steps.sync.outputs.after_sha }}
+          SYNC_STARTED_EPOCH: ${{ steps.sync.outputs.started_epoch }}
+          TREE_REF: ${{ steps.sync.outputs.after_sha || 'main' }}
+        run: bash "${RUNNER_TEMP}/fork-sync.sh" cleanup
+
+      - name: Open or update conflict issue
+        if: always() && steps.guard.outputs.proceed == 'true' && steps.sync.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_PROMPT_DISABLED: "1"
+          CONFLICT: ${{ steps.sync.outputs.conflict }}
+        run: bash "${RUNNER_TEMP}/fork-sync.sh" issue
+
+      - name: Fail job if sync failed or cleanup is unconfirmed
+        if: always() && steps.guard.outputs.proceed == 'true' && (steps.sync.outputs.ok == 'false' || steps.cleanup.outputs.confirmed == 'false')
+        env:
+          OK: ${{ steps.sync.outputs.ok }}
+          CONFIRMED: ${{ steps.cleanup.outputs.confirmed }}
+          SYNC_EXIT: ${{ steps.sync.outputs.sync_exit }}
+        run: bash "${RUNNER_TEMP}/fork-sync.sh" fail
